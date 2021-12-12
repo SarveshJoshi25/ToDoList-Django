@@ -1,0 +1,3 @@
+.gitignore
+ToDoListDjango/settings.py
+.env
