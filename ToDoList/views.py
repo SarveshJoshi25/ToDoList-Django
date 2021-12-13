@@ -1,6 +1,9 @@
 import json
 from django.http import HttpResponse, JsonResponse
 from uuid import uuid4
+
+from jwt import InvalidSignatureError
+
 from .models import User, Task
 from email_validator import validate_email, EmailNotValidError
 import bcrypt
@@ -16,6 +19,17 @@ MIN_PASSWORD_LENGTH = 7
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def jwt_token_decoder(request):
+    try:
+        return jwt.decode(request.headers['X-Auth-Token'], jwt_secret, algorithms=['HS256'])['user_id']
+    except InvalidSignatureError:
+        return JsonResponse({"error": "Invalid JWT Signature"})
+    except KeyError:
+        return JsonResponse({"error": "JWT-Token not found."})
+    except jwt.exceptions.DecodeError:
+        return JsonResponse({"error": "JWT-Token Decode Error."})
 
 
 @csrf_exempt
@@ -45,7 +59,8 @@ def user_login(request):
                 try:
                     user = User.objects.get(user_id=username)
                     if bcrypt.checkpw(password.encode("utf-8"), user.password.encode("utf-8")):
-                        return JsonResponse({"JWT_Token": jwt.encode({'user_id': username}, jwt_secret, algorithm='HS256')})
+                        return JsonResponse(
+                            {"JWT_Token": jwt.encode({'user_id': username}, jwt_secret, algorithm='HS256')})
                     else:
                         return JsonResponse({"error": "Wrong Password."})
                 except User.DoesNotExist:
@@ -119,13 +134,134 @@ def user_signup(request):
 
 @csrf_exempt
 def create_new_task(request):
+    """
+        View to create new task. Login Mandatory. JWT-Token should be sent with the request in a header named "X-Auth-Token".
+        Any length of Title and Description is accepted.
 
-    return JsonResponse({"message": "You are on Create New Task Page (Login Mandatory)."})
+        Sample Input:
+        {
+            "task_title":"Sample Task 1",
+            "task_description":"Sample Task Description"
+        }
+
+        Sample Output:
+        {
+            "success": "Task added successfully."
+        }
+    """
+    if request.method == "POST":
+        if request.body:
+            try:
+                received_data = json.loads(request.body.decode("utf-8"))
+                task_title = received_data["task_title"]
+                task_description = received_data["task_description"]
+                requesting_user_id = jwt_token_decoder(request=request)
+                requesting_user = User.objects.get(user_id=requesting_user_id)
+
+                save_this = Task(task_uuid=uuid4(), task_title=task_title, task_description=task_description,
+                                 task_done=False, task_owner=requesting_user)
+                save_this.save()
+                return JsonResponse({"success": "Task added successfully."})
+            except User.DoesNotExist:
+                return JsonResponse({"error": "Requesting User not found."})
+            except KeyError:
+                return JsonResponse({"error": "Required fields not found."})
+        else:
+            return JsonResponse({"error": "Data not found."})
+    else:
+        return JsonResponse({"error": "POST Request was expected."})
 
 
-def delete_a_task(request):
-    return JsonResponse({"message": "You are on deleting a task page (Login Mandatory)."})
+@csrf_exempt
+def delete_a_task(request, task_id):
+    if request.method == "POST":
+        try:
+            requested_user_id = jwt_token_decoder(request)
+            task = Task.objects.get(task_uuid=task_id)
+            user = User.objects.get(user_id=requested_user_id)
+            if task.task_owner_id != user.user_uuid:
+                return JsonResponse({"error": "Permission Denied. The task doesn't belong to requesting user."})
+            task.delete()
+            return JsonResponse({"success": "Task deleted successfully."})
+        except Task.DoesNotExist:
+            return JsonResponse({"error": "Task doesn't exists."})
+        except User.DoesNotExist:
+            return JsonResponse({"error": "User doesn't exists."})
+        except KeyError:
+            return JsonResponse({"error": "Required Fields not found."})
+    else:
+        return JsonResponse({"error": "POST Data was expected."})
 
 
+@csrf_exempt
 def view_all_tasks(request):
-    return JsonResponse({"message": "You are on view all tasks page (Login Mandatory)."})
+    if request.method == "POST":
+        try:
+            requested_user_id = jwt_token_decoder(request)
+            user = User.objects.get(user_id=requested_user_id)
+            something = Task.objects.filter(task_owner=user.user_uuid)
+            return_this = []
+            for some in something:
+                return_this.append({"task_id": some.task_uuid, "task_title": some.task_title, "task_description": some.task_description, "task_done": some.task_done})
+            if len(return_this) > 1:
+                return JsonResponse({"tasks": return_this})
+            return JsonResponse({"message": "User got no tasks to show."})
+
+        except User.DoesNotExist:
+            return JsonResponse({"error": "Requested User not found."})
+
+
+    else:
+        return JsonResponse({"error": "POST request was expected."})
+
+
+@csrf_exempt
+def edit_a_task(request, task_id):
+    if request.method == "POST":
+        if request.body:
+            try:
+                received_data = json.loads(request.body.decode("utf-8"))
+                task_title = received_data['task_title']
+                task_description = received_data['task_description']
+                requested_user_id = jwt_token_decoder(request)
+                task = Task.objects.get(task_uuid=task_id)
+                user = User.objects.get(user_id=requested_user_id)
+                if task.task_owner_id != user.user_uuid:
+                    return JsonResponse({"error": "Permission Denied. The task doesn't belong to requesting user."})
+                task.task_title, task.task_description = task_title, task_description
+                task.save()
+                return JsonResponse({"success": "Task edited successfully."})
+            except Task.DoesNotExist:
+                return JsonResponse({"error": "Task doesn't exists."})
+            except User.DoesNotExist:
+                return JsonResponse({"error": "User doesn't exists."})
+            except KeyError:
+                return JsonResponse({"error": "Required fields not found."})
+        else:
+            return JsonResponse({"error": "Request Body was not found."})
+    else:
+        return JsonResponse({"error": "POST request was expected."})
+
+
+@csrf_exempt
+def done_a_task(request, task_id):
+    if request.method == "POST":
+        try:
+            requested_user_id = jwt_token_decoder(request)
+            task = Task.objects.get(task_uuid=task_id)
+            user = User.objects.get(user_id=requested_user_id)
+            if task.task_owner_id != user.user_uuid:
+                return JsonResponse({"error": "Permission Denied. The task doesn't belong to requesting user."})
+            task.task_done = not task.task_done
+            task.save()
+            if task.task_done:
+                return JsonResponse({"success": "Task was marked Done."})
+            return JsonResponse({"success": "Task was marked Undone."})
+        except Task.DoesNotExist:
+            return JsonResponse({"error": "Task doesn't exists."})
+        except User.DoesNotExist:
+            return JsonResponse({"error": "User doesn't exists."})
+        except KeyError:
+            return JsonResponse({"error": "Required fields not found."})
+    else:
+        return JsonResponse({"error": "POST request was expected."})
